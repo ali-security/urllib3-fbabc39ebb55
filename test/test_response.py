@@ -483,6 +483,93 @@ class TestResponse(object):
         with pytest.raises(StopIteration):
             next(stream)
 
+    def test_read_with_illegal_mix_decode_toggle(self):
+        compress = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+        data = compress.compress(b"foo")
+        data += compress.flush()
+
+        fp = BytesIO(data)
+
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "deflate"}, preload_content=False
+        )
+
+        # There is no decoded-data buffer here, a read() returns whatever the
+        # decoder yields for the raw bytes consumed. All but the last byte of
+        # the stream decodes to b"foo" and leaves a byte for the read() below.
+        assert resp.read(len(data) - 1) == b"foo"
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"Calling read\(decode_content=False\) is not supported after "
+                r"read\(decode_content=True\) was called"
+            ),
+        ):
+            resp.read(1, decode_content=False)
+
+    def test_read_with_mix_decode_toggle(self):
+        compress = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+        data = compress.compress(b"foo")
+        data += compress.flush()
+
+        fp = BytesIO(data)
+
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "deflate"}, preload_content=False
+        )
+        resp.read(1, decode_content=False)
+        assert resp.read(len(data) - 1, decode_content=True) == b"oo"
+
+    @mock.patch("urllib3.response.GzipDecoder.decompress")
+    def test_drain_conn_does_not_decode_content(self, gzip_decompress):
+        # A gzip bomb: tiny on the wire, huge once decompressed. Draining the
+        # connection (as redirect handling does) must not decompress it.
+        compress = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+        data = compress.compress(b"0" * 1024 * 1024)
+        data += compress.flush()
+
+        fp = BytesIO(data)
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "gzip"}, preload_content=False
+        )
+
+        resp.drain_conn()
+
+        assert not gzip_decompress.called
+
+    def test_drain_conn_does_not_decode_after_partial_read(self):
+        """
+        CVE-2026-44432: draining after a partial decoded read must not decode
+        the remainder either. `_has_decoded_content` being True is not a
+        licence to decompress everything that is left in a single operation.
+        """
+        compress = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+        compressed_data = compress.compress(b"\0" * (8 * 2 ** 20))
+        compressed_data += compress.flush()
+        fp = BytesIO(compressed_data)
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "gzip"}, preload_content=False
+        )
+
+        # There is no decoded-data buffer here, a read() returns whatever the
+        # decoder yields for the raw bytes consumed. Decode only the first
+        # half of the body and leave the rest on the wire.
+        data = resp.read(len(compressed_data) // 2)
+        assert data
+        assert data == b"\0" * len(data)
+        assert resp._has_decoded_content is True
+        assert fp.tell() < len(compressed_data)
+
+        with mock.patch("urllib3.response.GzipDecoder.decompress") as decompress:
+            resp.drain_conn()
+
+        decompress.assert_not_called()
+        # The decoder is dropped so nothing is retained.
+        assert resp._decoder is None
+        # The body is still read off the wire so the connection can be reused.
+        assert fp.tell() == len(compressed_data)
+
     def test_gzipped_streaming(self):
         compress = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
         data = compress.compress(b"foo")
