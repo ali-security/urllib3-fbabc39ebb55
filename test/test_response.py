@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 
 import contextlib
+import gzip
 import re
 import socket
 import ssl
+import sys
 import zlib
 from base64 import b64decode
 from io import BufferedReader, BytesIO, TextIOWrapper
@@ -24,9 +26,146 @@ from urllib3.exceptions import (
     httplib_IncompleteRead,
 )
 from urllib3.packages.six.moves import http_client as httplib
-from urllib3.response import HTTPResponse, brotli
+from urllib3.response import BytesQueueBuffer, HTTPResponse, brotli
 from urllib3.util.response import is_fp_closed
 from urllib3.util.retry import RequestHistory, Retry
+
+
+def deflate2_compress(data):
+    compressor = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+    return compressor.compress(data) + compressor.flush()
+
+
+def drain_bounded(iterator, amt, max_chunks):
+    """
+    Join everything ``iterator`` yields, asserting each chunk holds at most
+    ``amt`` decoded bytes.
+
+    ``max_chunks`` guards against a regression that never stops yielding: the
+    test then fails instead of hanging the job.
+    """
+    chunks = []
+    for chunk in iterator:
+        assert len(chunk) <= amt
+        chunks.append(chunk)
+        assert len(chunks) <= max_chunks, "iterator did not terminate"
+    return b"".join(chunks)
+
+
+if brotli:
+    try:
+        brotli.Decompressor().process(b"", output_buffer_limit=1024)
+        _brotli_gte_1_2_0_available = True
+    except (AttributeError, TypeError):
+        _brotli_gte_1_2_0_available = False
+else:
+    _brotli_gte_1_2_0_available = False
+
+
+class TestBytesQueueBuffer(object):
+    def test_single_chunk(self):
+        buffer = BytesQueueBuffer()
+        assert len(buffer) == 0
+        with pytest.raises(RuntimeError, match="buffer is empty"):
+            assert buffer.get(10)
+
+        assert buffer.get(0) == b""
+
+        buffer.put(b"foo")
+        with pytest.raises(ValueError, match="n should be > 0"):
+            buffer.get(-1)
+
+        assert buffer.get(1) == b"f"
+        assert buffer.get(2) == b"oo"
+        with pytest.raises(RuntimeError, match="buffer is empty"):
+            assert buffer.get(10)
+
+    def test_read_too_much(self):
+        buffer = BytesQueueBuffer()
+        buffer.put(b"foo")
+        assert buffer.get(100) == b"foo"
+
+    def test_multiple_chunks(self):
+        buffer = BytesQueueBuffer()
+        buffer.put(b"foo")
+        buffer.put(b"bar")
+        buffer.put(b"baz")
+        assert len(buffer) == 9
+
+        assert buffer.get(1) == b"f"
+        assert len(buffer) == 8
+        assert buffer.get(4) == b"ooba"
+        assert len(buffer) == 4
+        assert buffer.get(4) == b"rbaz"
+        assert len(buffer) == 0
+
+    def test_get_all_empty(self):
+        q = BytesQueueBuffer()
+        assert q.get_all() == b""
+        assert len(q) == 0
+
+    def test_get_all_single(self):
+        q = BytesQueueBuffer()
+        q.put(b"a")
+        assert q.get_all() == b"a"
+        assert len(q) == 0
+
+    def test_get_all_many(self):
+        q = BytesQueueBuffer()
+        q.put(b"a")
+        q.put(b"b")
+        q.put(b"c")
+        assert q.get_all() == b"abc"
+        assert len(q) == 0
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 8), reason="pytest-memray requires Python 3.8+"
+    )
+    @pytest.mark.limit_memory("12.5 MB")  # assert that we're not doubling memory usage
+    def test_memory_usage(self):
+        # Allocate 10 1MiB chunks
+        buffer = BytesQueueBuffer()
+        for i in range(10):
+            # This allocates 2MiB, putting the max at around 12MiB. Not sure why.
+            buffer.put(bytes(b"\0" * 2 ** 20))
+
+        assert len(buffer.get(10 * 2 ** 20)) == 10 * 2 ** 20
+
+    @pytest.mark.parametrize(
+        "get_func",
+        (lambda b: b.get(len(b)), lambda b: b.get_all()),
+        ids=("get", "get_all"),
+    )
+    @pytest.mark.limit_memory("10.01 MB", current_thread_only=True)
+    def test_memory_usage_single_chunk(self, get_func):
+        buffer = BytesQueueBuffer()
+        chunk = b"\0" * (10 * 2 ** 20)  # 10 MiB
+        buffer.put(chunk)
+        assert get_func(buffer) is chunk
+
+    @pytest.mark.parametrize(
+        "finish_with_get_all",
+        (True, False),
+        ids=("finish_with_get_all", "finish_with_get"),
+    )
+    @pytest.mark.limit_memory("11.01 MB", current_thread_only=True)
+    def test_memory_usage_splitting_chunk(self, finish_with_get_all):
+        # Allocate a single 10MiB chunk, then read it in two parts.
+        # Verifies that splitting a chunk doesn't cause additional memory
+        # allocation.
+        buffer = BytesQueueBuffer()
+        chunk = b"\0" * (10 * 2 ** 20)  # 10 MiB
+        buffer.put(chunk)
+        for i in range(10):
+            if finish_with_get_all and i == 9:
+                result = buffer.get_all()
+            else:
+                result = buffer.get(2 ** 20)
+            assert type(result) is bytes
+            assert len(result) == 2 ** 20
+            del result
+        assert len(buffer) == 0
+
 
 # A known random (i.e, not-too-compressible) payload generated with:
 #    "".join(random.choice(string.printable) for i in xrange(512))
@@ -53,6 +192,18 @@ def sock():
     s.close()
 
 
+if not hasattr(gzip, "compress"):
+    # Python 2.7 has no `gzip.compress` helper.
+    def _gzip_compress(data, compresslevel=9):
+        out = BytesIO()
+        gzip_s = gzip.GzipFile(fileobj=out, mode="wb", compresslevel=compresslevel)
+        gzip_s.write(data)
+        gzip_s.close()
+        return out.getvalue()
+
+    gzip.compress = _gzip_compress
+
+
 class TestLegacyResponse(object):
     def test_getheaders(self):
         headers = {"host": "example.com"}
@@ -67,9 +218,19 @@ class TestLegacyResponse(object):
 
 class TestResponse(object):
     def test_cache_content(self):
-        r = HTTPResponse("foo")
-        assert r.data == "foo"
-        assert r._body == "foo"
+        r = HTTPResponse(b"foo")
+        assert r._body == b"foo"
+        assert r.data == b"foo"
+        assert r._body == b"foo"
+
+    def test_cache_content_preload_false(self):
+        fp = BytesIO(b"foo")
+        r = HTTPResponse(fp, preload_content=False)
+
+        assert not r._body
+        assert r.data == b"foo"
+        assert r._body == b"foo"
+        assert r.data == b"foo"
 
     def test_default(self):
         r = HTTPResponse()
@@ -134,12 +295,7 @@ class TestResponse(object):
             fp, headers={"content-encoding": "deflate"}, preload_content=False
         )
 
-        assert r.read(3) == b""
-        # Buffer in case we need to switch to the raw stream
-        assert r._decoder._data is not None
         assert r.read(1) == b"f"
-        # Now that we've decoded data, we just stream through the decoder
-        assert r._decoder._data is None
         assert r.read(2) == b"oo"
         assert r.read() == b""
         assert r.read() == b""
@@ -154,10 +310,7 @@ class TestResponse(object):
             fp, headers={"content-encoding": "deflate"}, preload_content=False
         )
 
-        assert r.read(1) == b""
         assert r.read(1) == b"f"
-        # Once we've decoded data, we just stream to the decoder; no buffering
-        assert r._decoder._data is None
         assert r.read(2) == b"oo"
         assert r.read() == b""
         assert r.read() == b""
@@ -172,7 +325,6 @@ class TestResponse(object):
             fp, headers={"content-encoding": "gzip"}, preload_content=False
         )
 
-        assert r.read(11) == b""
         assert r.read(1) == b"f"
         assert r.read(2) == b"oo"
         assert r.read() == b""
@@ -188,6 +340,27 @@ class TestResponse(object):
         r = HTTPResponse(fp, headers={"content-encoding": "gzip"})
 
         assert r.data == b"foofoofoo"
+
+    @pytest.mark.parametrize("read_amt", (None, 1, 2, 3, 4))
+    def test_decode_gzip_multi_member_bounded_by_amt(self, read_amt):
+        # A gzip body may carry several members. Rolling over into the next
+        # member must not decode past the amount the caller asked for.
+        data = gzip.compress(b"foo") + gzip.compress(b"bar")
+
+        fp = BytesIO(data)
+        r = HTTPResponse(
+            fp, headers={"content-encoding": "gzip"}, preload_content=False
+        )
+
+        result = bytearray()
+        for _ in range(20):
+            chunk = r.read(read_amt, decode_content=True)
+            if not chunk:
+                break
+            if read_amt is not None:
+                assert len(chunk) <= read_amt
+            result += chunk
+        assert bytes(result) == b"foobar"
 
     def test_decode_gzip_error(self):
         fp = BytesIO(b"foo")
@@ -254,6 +427,277 @@ class TestResponse(object):
         with pytest.raises(DecodeError):
             HTTPResponse(fp, headers={"content-encoding": "br"})
 
+    _test_compressor_params = [
+        ("deflate1", ("deflate", zlib.compress)),
+        ("deflate2", ("deflate", deflate2_compress)),
+        ("gzip", ("gzip", gzip.compress)),
+    ]
+    if _brotli_gte_1_2_0_available:
+        _test_compressor_params.append(("brotli", ("br", brotli.compress)))
+    else:
+        _test_compressor_params.append(("brotli", None))
+
+    @pytest.mark.parametrize("read_method", ("read",))
+    @pytest.mark.parametrize(
+        "data",
+        [d[1] for d in _test_compressor_params],
+        ids=[d[0] for d in _test_compressor_params],
+    )
+    def test_read_with_all_data_already_in_decompressor(
+        self,
+        request,
+        read_method,
+        data,
+    ):
+        if data is None:
+            pytest.skip(
+                "Proper %s decoder is not available" % (request.node.callspec.id,)
+            )
+        original_data = b"bar" * 1000
+        name, compress_func = data
+        compressed_data = compress_func(original_data)
+        fp = mock.Mock(read=mock.Mock(return_value=b""))
+        r = HTTPResponse(fp, headers={"content-encoding": name}, preload_content=False)
+        # Put all data in the decompressor's buffer.
+        r._init_decoder()
+        assert r._decoder is not None
+        decoded = r._decoder.decompress(compressed_data, max_length=0)
+        if name == "br":
+            # It's known that some Brotli libraries do not respect
+            # `max_length`.
+            r._decoded_buffer.put(decoded)
+        else:
+            assert decoded == b""
+        # Read the data via `HTTPResponse`.
+        read = getattr(r, read_method)
+        assert read(0) == b""
+        assert read(2500) == original_data[:2500]
+        assert read(500) == original_data[2500:]
+        assert read(0) == b""
+        assert read() == b""
+
+    @pytest.mark.parametrize("read_method", ("read_chunked", "stream"))
+    @pytest.mark.parametrize(
+        "data",
+        [d[1] for d in _test_compressor_params],
+        ids=[d[0] for d in _test_compressor_params],
+    )
+    def test_read_chunked_with_all_data_already_in_decompressor(
+        self,
+        request,
+        read_method,
+        data,
+    ):
+        if data is None:
+            pytest.skip(
+                "Proper %s decoder is not available" % (request.node.callspec.id,)
+            )
+        original_data = b"0" * 100000  # 100 KB
+        name, compress_func = data
+        compressed_data = compress_func(original_data)
+        httplib_r = httplib.HTTPResponse(MockSock)
+        httplib_r.fp = MockChunkedEncodingResponse([compressed_data])
+        r = HTTPResponse(
+            httplib_r,
+            preload_content=False,
+            headers={"transfer-encoding": "chunked", "content-encoding": name},
+        )
+        # Mark the current chunk as fully read.
+        r.chunk_left = 0
+        # Feed all compressed data to the decoder.
+        r._init_decoder()
+        assert r._decoder is not None
+        initially_decoded = r._decoder.decompress(compressed_data, max_length=0)
+        result = list(getattr(r, read_method)(amt=10240, decode_content=True))
+        if name == "br":
+            # It's known that some Brotli libraries do not respect
+            # `max_length`.
+            result = [initially_decoded] + list(result)
+        else:
+            assert initially_decoded == b""
+            assert all(len(chunk) == 10240 for chunk in result[:-1])
+            assert len(result[-1]) == len(original_data) % 10240
+        assert b"".join(result) == original_data
+
+    @pytest.mark.parametrize("read_method", ("read", "stream"))
+    def test_decode_bomb_is_bounded_by_amt(self, read_method):
+        # A decompression bomb: tiny on the wire, huge once decoded. A caller
+        # asking for `amt` bytes must never be handed more than `amt` bytes of
+        # decoded data, otherwise the response amplifies into memory.
+        payload = b"\0" * (8 * 2 ** 20)  # 8 MiB
+        compressed = zlib.compress(payload)
+        # Small enough that one unbounded read of `amt` raw bytes would hand
+        # back the whole payload.
+        assert len(compressed) < 16 * 1024
+
+        amt = 1024
+        fp = BytesIO(compressed)
+        r = HTTPResponse(
+            fp, headers={"content-encoding": "deflate"}, preload_content=False
+        )
+        if read_method == "read":
+            assert len(r.read(amt, decode_content=True)) == amt
+            assert len(r.read(amt, decode_content=True)) == amt
+        else:
+            stream = r.stream(amt, decode_content=True)
+            assert drain_bounded(stream, amt, 2 * len(payload) // amt) == payload
+
+    @pytest.mark.parametrize("read_method", ("read", "stream"))
+    def test_multi_decode_bomb_is_bounded_by_amt(self, read_method):
+        # The same bomb behind a chain of content encodings. Every decoder in
+        # the chain has to honour the caller's `amt`, otherwise an inner layer
+        # still amplifies into memory.
+        payload = b"\0" * (8 * 2 ** 20)  # 8 MiB
+        compressed = zlib.compress(zlib.compress(payload))
+        assert len(compressed) < 16 * 1024
+
+        amt = 1024
+        fp = BytesIO(compressed)
+        r = HTTPResponse(
+            fp,
+            headers={"content-encoding": "deflate, deflate"},
+            preload_content=False,
+        )
+        if read_method == "read":
+            assert len(r.read(amt, decode_content=True)) == amt
+            assert len(r.read(amt, decode_content=True)) == amt
+        else:
+            stream = r.stream(amt, decode_content=True)
+            assert drain_bounded(stream, amt, 2 * len(payload) // amt) == payload
+
+    @pytest.mark.parametrize("read_method", ("read_chunked", "stream"))
+    def test_chunked_decode_bomb_is_bounded_by_amt(self, read_method):
+        # Same decompression bomb, delivered with
+        # ``transfer-encoding: chunked``. The decoder's buffered tail has to be
+        # drained `amt` bytes at a time instead of pulling further wire chunks
+        # and flushing everything at once.
+        payload = b"\0" * (8 * 2 ** 20)  # 8 MiB
+        compressed = zlib.compress(payload)
+        assert len(compressed) < 16 * 1024
+
+        amt = 1024
+        httplib_r = httplib.HTTPResponse(MockSock)
+        httplib_r.fp = MockChunkedEncodingResponse([compressed])
+        r = HTTPResponse(
+            httplib_r,
+            preload_content=False,
+            headers={"transfer-encoding": "chunked", "content-encoding": "deflate"},
+        )
+        chunks = getattr(r, read_method)(amt=amt, decode_content=True)
+        assert drain_bounded(chunks, amt, 2 * len(payload) // amt) == payload
+
+    @pytest.mark.parametrize(
+        "delta",
+        (
+            0,  # First read from socket returns all compressed data.
+            -1,  # First read from socket returns all but one byte of compressed data.
+        ),
+    )
+    @pytest.mark.parametrize("read_method", ("read",))
+    @pytest.mark.parametrize(
+        "data",
+        [d[1] for d in _test_compressor_params],
+        ids=[d[0] for d in _test_compressor_params],
+    )
+    def test_decode_with_max_length_close_to_compressed_data_size(
+        self,
+        request,
+        delta,
+        read_method,
+        data,
+    ):
+        """
+        Test decoding when the first read from the socket returns all or
+        almost all the compressed data, but then it has to be
+        decompressed in a couple of read calls.
+        """
+        if data is None:
+            pytest.skip(
+                "Proper %s decoder is not available" % (request.node.callspec.id,)
+            )
+
+        original_data = b"foo" * 1000
+        name, compress_func = data
+        compressed_data = compress_func(original_data)
+        fp = BytesIO(compressed_data)
+        r = HTTPResponse(fp, headers={"content-encoding": name}, preload_content=False)
+        initial_limit = len(compressed_data) + delta
+        read = getattr(r, read_method)
+        initial_chunk = read(amt=initial_limit, decode_content=True)
+        assert len(initial_chunk) == initial_limit
+        assert (
+            len(read(amt=len(original_data), decode_content=True))
+            == len(original_data) - initial_limit
+        )
+
+    # Prepare 50 MB of compressed data outside of the test measuring
+    # memory usage.
+    _test_memory_usage_decode_with_max_length_params = [
+        (
+            params[0],
+            (params[1][0], params[1][1](b"A" * (50 * 2 ** 20))) if params[1] else None,
+        )
+        for params in _test_compressor_params
+    ]
+
+    @pytest.mark.parametrize(
+        "data",
+        [d[1] for d in _test_memory_usage_decode_with_max_length_params],
+        ids=[d[0] for d in _test_memory_usage_decode_with_max_length_params],
+    )
+    @pytest.mark.parametrize("read_method", ("read", "read_chunked", "stream"))
+    # Decoders consume different amounts of memory during decompression.
+    # We set the 10 MB limit to ensure that the whole decompressed data
+    # is not stored unnecessarily.
+    #
+    # FYI, the following consumption was observed for the test with
+    # `read` on CPython 3.14.0:
+    #   - deflate: 2.3 MiB
+    #   - deflate2: 2.1 MiB
+    #   - gzip: 2.1 MiB
+    #   - brotli:
+    #     - brotli v1.2.0: 9 MiB
+    #     - brotlicffi v1.2.0.0: 6 MiB
+    #     - brotlipy v0.7.0: 105.8 MiB
+    #   - zstd: 4.5 MiB
+    @pytest.mark.limit_memory("10 MB", current_thread_only=True)
+    def test_memory_usage_decode_with_max_length(
+        self,
+        request,
+        read_method,
+        data,
+    ):
+        if data is None:
+            pytest.skip(
+                "Proper %s decoder is not available" % (request.node.callspec.id,)
+            )
+
+        name, compressed_data = data
+        limit = 1024 * 1024  # 1 MiB
+        if read_method in ("read_chunked", "stream"):
+            httplib_r = httplib.HTTPResponse(MockSock)
+            httplib_r.fp = MockChunkedEncodingResponse([compressed_data])
+            r = HTTPResponse(
+                httplib_r,
+                preload_content=False,
+                headers={"transfer-encoding": "chunked", "content-encoding": name},
+            )
+            next(getattr(r, read_method)(amt=limit, decode_content=True))
+        else:
+            fp = BytesIO(compressed_data)
+            r = HTTPResponse(
+                fp, headers={"content-encoding": name}, preload_content=False
+            )
+            getattr(r, read_method)(amt=limit, decode_content=True)
+
+        # Check that the internal decoded buffer is empty unless brotli
+        # is used.
+        # Google's brotli library does not fully respect the output
+        # buffer limit: https://github.com/google/brotli/issues/1396
+        # And unmaintained brotlipy cannot limit the output buffer size.
+        if name != "br" or brotli.__name__ == "brotlicffi":
+            assert len(r._decoded_buffer) == 0
+
     def test_multi_decoding_deflate_deflate(self):
         data = zlib.compress(zlib.compress(b"foo"))
 
@@ -297,6 +741,23 @@ class TestResponse(object):
                     "content-encoding": "gzip, deflate, br, zstd, gzip, deflate"
                 },
             )
+
+    def test_read_multi_decoding_deflate_deflate(self):
+        msg = b"foobarbaz" * 42
+        data = zlib.compress(zlib.compress(msg))
+
+        fp = BytesIO(data)
+        r = HTTPResponse(
+            fp, headers={"content-encoding": "deflate, deflate"}, preload_content=False
+        )
+
+        assert r.read(3) == b"foo"
+        assert r.read(3) == b"bar"
+        assert r.read(3) == b"baz"
+        assert r.read(9) == b"foobarbaz"
+        assert r.read(9 * 3) == b"foobarbaz" * 3
+        assert r.read(9 * 37) == b"foobarbaz" * 37
+        assert r.read() == b""
 
     def test_body_blob(self):
         resp = HTTPResponse(b"foo")
@@ -494,10 +955,7 @@ class TestResponse(object):
             fp, headers={"content-encoding": "deflate"}, preload_content=False
         )
 
-        # There is no decoded-data buffer here, a read() returns whatever the
-        # decoder yields for the raw bytes consumed. All but the last byte of
-        # the stream decodes to b"foo" and leaves a byte for the read() below.
-        assert resp.read(len(data) - 1) == b"foo"
+        assert resp.read(1) == b"f"
 
         with pytest.raises(
             RuntimeError,
@@ -581,8 +1039,8 @@ class TestResponse(object):
         )
         stream = resp.stream(2)
 
-        assert next(stream) == b"f"
-        assert next(stream) == b"oo"
+        assert next(stream) == b"fo"
+        assert next(stream) == b"o"
         with pytest.raises(StopIteration):
             next(stream)
 
@@ -611,6 +1069,7 @@ class TestResponse(object):
         # Ensure that ``tell()`` returns the correct number of bytes when
         # part-way through streaming compressed content.
         NUMBER_OF_READS = 10
+        PART_SIZE = 64
 
         class MockCompressedDataReading(BytesIO):
             """
@@ -639,7 +1098,7 @@ class TestResponse(object):
         resp = HTTPResponse(
             fp, headers={"content-encoding": "deflate"}, preload_content=False
         )
-        stream = resp.stream()
+        stream = resp.stream(PART_SIZE)
 
         parts_positions = [(part, resp.tell()) for part in stream]
         end_of_stream = resp.tell()
@@ -654,11 +1113,27 @@ class TestResponse(object):
         assert uncompressed_data == payload
 
         # Check that the positions in the stream are correct
-        expected = [(i + 1) * payload_part_size for i in range(NUMBER_OF_READS)]
-        assert expected == list(positions)
+        # It is difficult to determine programatically what the positions
+        # returned by `tell` will be because the `HTTPResponse.read` method may
+        # call socket `read` a couple of times if it doesn't have enough data
+        # in the buffer or not call socket `read` at all if it has enough. All
+        # this depends on the message, how it was compressed, what is
+        # `PART_SIZE` and `payload_part_size`.
+        # So for simplicity the expected values are hardcoded.
+        expected = (92, 184, 230, 276, 322, 368, 414, 460)
+        assert expected == positions
 
         # Check that the end of the stream is in the correct place
         assert len(ZLIB_PAYLOAD) == end_of_stream
+
+        # Check that all parts have expected length
+        expected_last_part_size = len(uncompressed_data) % PART_SIZE
+        whole_parts = len(uncompressed_data) // PART_SIZE
+        if expected_last_part_size == 0:
+            expected_lengths = [PART_SIZE] * whole_parts
+        else:
+            expected_lengths = [PART_SIZE] * whole_parts + [expected_last_part_size]
+        assert expected_lengths == [len(part) for part in parts]
 
     def test_deflate_streaming(self):
         data = zlib.compress(b"foo")
@@ -669,8 +1144,8 @@ class TestResponse(object):
         )
         stream = resp.stream(2)
 
-        assert next(stream) == b"f"
-        assert next(stream) == b"oo"
+        assert next(stream) == b"fo"
+        assert next(stream) == b"o"
         with pytest.raises(StopIteration):
             next(stream)
 
@@ -685,8 +1160,8 @@ class TestResponse(object):
         )
         stream = resp.stream(2)
 
-        assert next(stream) == b"f"
-        assert next(stream) == b"oo"
+        assert next(stream) == b"fo"
+        assert next(stream) == b"o"
         with pytest.raises(StopIteration):
             next(stream)
 
@@ -697,6 +1172,34 @@ class TestResponse(object):
 
         with pytest.raises(StopIteration):
             next(stream)
+
+    @pytest.mark.parametrize(
+        "preload_content, amt",
+        [(True, None), (False, None), (False, 10 * 2 ** 20)],
+    )
+    @pytest.mark.limit_memory("25 MB")
+    def test_buffer_memory_usage_decode_one_chunk(self, preload_content, amt):
+        content_length = 10 * 2 ** 20  # 10 MiB
+        fp = BytesIO(zlib.compress(b"\0" * content_length))
+        resp = HTTPResponse(
+            fp,
+            preload_content=preload_content,
+            headers={"content-encoding": "deflate"},
+        )
+        data = resp.data if preload_content else resp.read(amt)
+        assert len(data) == content_length
+
+    @pytest.mark.parametrize(
+        "preload_content, amt",
+        [(True, None), (False, None), (False, 10 * 2 ** 20)],
+    )
+    @pytest.mark.limit_memory("10.5 MB")
+    def test_buffer_memory_usage_no_decoding(self, preload_content, amt):
+        content_length = 10 * 2 ** 20  # 10 MiB
+        fp = BytesIO(b"\0" * content_length)
+        resp = HTTPResponse(fp, preload_content=preload_content, decode_content=False)
+        data = resp.data if preload_content else resp.read(amt)
+        assert len(data) == content_length
 
     def test_length_no_header(self):
         fp = BytesIO(b"12345")
