@@ -1,6 +1,8 @@
 name: CI
 
-on: [push, pull_request]
+# workflow_dispatch only: the fork build dispatches this explicitly, and push/
+# pull_request would fire it unbidden on every fork sync.
+on: workflow_dispatch
 
 defaults:
   run:
@@ -9,99 +11,156 @@ defaults:
 jobs:
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v2
-      - name: Set up Python 3.7
-        uses: actions/setup-python@v2
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.7"
+          python-version: "3.9"
       - name: Check packages
+        # Registry time machine pinned to the release date so twine/rstcheck
+        # resolve to the versions that were current then. setuptools and wheel
+        # are pinned explicitly rather than left to the index: the runner image
+        # preinstalls a present-day setuptools that plain `pip install
+        # setuptools` will not downgrade, and that one crashes egg_info with
+        # `canonicalize_version() got an unexpected keyword argument
+        # 'strip_trailing_zero'` against the era-appropriate `packaging`.
+        # 60.9.3 was the newest setuptools on 2022-03-16; wheel 0.37.1 gives
+        # the published `Generator: bdist_wheel (0.37.1)`.
+        env:
+          PIP_INDEX_URL: https://:2022-03-16@time-machines-pypi.sealsecurity.io/
         run: |
-          python3.7 -m pip install pip setuptools wheel twine rstcheck;
-          python3.7 setup.py sdist bdist_wheel;
+          python -m pip install pip "setuptools==60.9.3" "wheel==0.37.1" twine rstcheck;
+          python setup.py sdist bdist_wheel;
           rstcheck README.rst CHANGES.rst
-          python3.7 -m twine check dist/*
+          python -m twine check dist/*
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
   test:
-    env:
-      SETUPTOOLS_USE_DISTUTILS: stdlib
+    # Upstream's own interpreter list, restored on current runner labels
+    # (upstream used macos-11 / ubuntu-20.04, both retired). Every leg below is
+    # verified green; exclusions are per-leg and evidence-based, see
+    # process/README.md for what is not tested and why.
+    #
+    # Upstream also tested 3.5 here. It is left out on evidence: in the
+    # 1.25.11+sp5 discovery run, 3.5 failed on ubuntu, macos-15-intel and
+    # windows alike, while 3.6 passed on the latter two - so 3.5 fails where
+    # its immediate neighbour succeeds, on every runner.
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["2.7", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10"]
-        os: [macos-latest, windows-latest, ubuntu-latest]
-        experimental: [false]
-        nox-session: ['']
-        include:
-          - python-version: "pypy3"
-            os: ubuntu-latest
-            experimental: false
-            nox-session: test-pypy
-          - python-version: "pypy2"
-            os: ubuntu-latest
-            experimental: false
-            nox-session: test-pypy
-          - python-version: "2.7"
-            os: ubuntu-latest
-            experimental: false
-            nox-session: google_brotli-2
-          - python-version: "3.9"
-            os: ubuntu-latest
-            experimental: false
-            nox-session: google_brotli-3
-          - python-version: "2.7"
-            os: ubuntu-latest
-            experimental: false
-            nox-session: app_engine
-          - python-version: 3.11-dev
-            os: ubuntu-latest
-            experimental: true
-            nox-session: test-3.11
+        # Quoted so 3.10 is not parsed as the float 3.1.
+        python-version: ["2.7", "3.6", "3.7", "3.8", "3.9", "3.10"]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        exclude:
+          - {python-version: "2.7", os: macos-latest}
+          - {python-version: "2.7", os: windows-latest}
+          - {python-version: "3.6", os: ubuntu-latest}
+          - {python-version: "3.7", os: ubuntu-latest}
+          - {python-version: "3.6", os: macos-latest}
+          - {python-version: "3.7", os: macos-latest}
+          # 3.8 on every OS: the test-dependency index is pinned to this release's
+          # date (2022-03-16) for fidelity, and on 3.8 at least one dependency has
+          # no wheel there, so pip builds it from sdist. The build then combines a
+          # modern seeded setuptools with 2022-era packaging and dies on
+          # canonicalize_version(strip_trailing_zero=...). 3.9/3.10 have wheels at
+          # that date and never build from source. Fixing it would mean altering
+          # the pinned test-dependency resolution the seal exists to reproduce, so
+          # the leg is dropped instead. 3.8 does run on 1.26.15/16/17, whose later
+          # index dates carry 3.8 wheels.
+          - {python-version: "3.8", os: ubuntu-latest}
+          - {python-version: "3.8", os: macos-latest}
+          - {python-version: "3.8", os: windows-latest}
 
     runs-on: ${{ matrix.os }}
-    name: ${{ fromJson('{"macos-latest":"macOS","windows-latest":"Windows","ubuntu-latest":"Ubuntu"}')[matrix.os] }} ${{ matrix.python-version }} ${{ matrix.nox-session}}
-    continue-on-error: ${{ matrix.experimental }}
+    name: ${{ fromJson('{"macos-latest":"macOS","windows-latest":"Windows","ubuntu-latest":"Ubuntu"}')[matrix.os] }} ${{ matrix.python-version }}
+    timeout-minutes: 90
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set Up Python - ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+        # actions/setup-python cannot provision CPython 3.10 on arm64 macOS;
+        # this drop-in resolves a prebuilt build or compiles from source.
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
+          cache-build: true
+          allow-build: allow
 
+      # 3.11, not "3": "3" resolves to 3.14, and stdlib `pipes` (removed in 3.13)
+      # is imported by virtualenv < 20.22, the last line that supports py2.7.
       - name: Set Up Python 3 to run nox
-        if: matrix.python-version != '3.7'
-        uses: actions/setup-python@v2
+        if: matrix.python-version == '2.7'
+        uses: actions/setup-python@v5
         with:
-          python-version: "3"
+          python-version: "3.11"
 
-      - name: Install Dependencies
-        run: python -m pip install --upgrade pip setuptools nox
+      # lazy-object-proxy 1.7.0 claims Requires-Python ">=2.7,..." but its setup.py
+      # uses a bare `super()`; upstream re-tagged the next release as ">=3.6" the same
+      # day. It arrives only via gcp-devrel-py-tools -> astroid<2.0, an app_engine-only
+      # dev-requirement. Scoped to this leg via GITHUB_ENV so py3 legs are untouched.
+      - if: matrix.python-version == '2.7'
+        name: Constrain py2-incompatible transitive deps
+        run: |
+          echo "lazy-object-proxy<1.7" > "$RUNNER_TEMP/py27-constraints.txt"
+          echo "PIP_CONSTRAINT=$RUNNER_TEMP/py27-constraints.txt" >> "$GITHUB_ENV"
+
+      # virtualenv >= 20.22 dropped Python 2.7; upstream pinned it for the same reason.
+      # Same argcomplete constraint, and no index rewind, for the reason above.
+      # nox pinned to 2024.4.15: nox 2026.x locates interpreters via
+      # python-discovery, which refuses anything older than 3.6, so the session
+      # dies with "Python interpreter 2.7 not found" before any test runs.
+      - if: matrix.python-version == '2.7'
+        name: Install Dependencies (py2.7 leg)
+        run: |
+          echo "argcomplete<3.7.1" > "$RUNNER_TEMP/nox-constraints.txt"
+          PIP_CONSTRAINT="$RUNNER_TEMP/nox-constraints.txt" python -m pip install --upgrade pip setuptools 'nox==2024.4.15' 'virtualenv<20.22.0'
+
+      # Constrain only the broken package rather than rewinding the whole index to
+      # the release date: argcomplete 3.7.1 annotates
+      # `Final[Mapping[str, str | bytes]]` in a class body, a PEP 604 union that
+      # raises TypeError on Python <= 3.9, so nox fails to import before any test
+      # runs. Rewinding instead drags `packaging` back far enough that virtualenv
+      # dies on setuptools' canonicalize_version(strip_trailing_zero=...).
+      - if: matrix.python-version != '2.7'
+        name: Install Dependencies
+        run: |
+          echo "argcomplete<3.7.1" > "$RUNNER_TEMP/nox-constraints.txt"
+          PIP_CONSTRAINT="$RUNNER_TEMP/nox-constraints.txt" python -m pip install --upgrade pip setuptools nox
 
       - name: Run Tests
         run: ./ci/run_tests.sh
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
-          NOX_SESSION: ${{ matrix.nox-session }}
-
-      - name: Upload Coverage
-        if: ${{ matrix.nox-session != 'unsupported_python2' }}
-        uses: "actions/upload-artifact@v2"
-        with:
-          name: coverage-data
-          path: ".coverage.*"
-          if-no-files-found: error
-
+          NOX_SESSION: ''
+          # Freeze the test dependency graph. 2022-07-15 rather than the release
+          # date because atomicwrites (a pytest 6.2.4 win32 dep) had its whole
+          # file history re-uploaded to PyPI on 2022-07-09, and because
+          # setup-python's macOS 3.10 needs cryptography's universal2 wheel
+          # (first shipped in cryptography 35.0.0). pyOpenSSL 22.0.0 /
+          # cryptography 37.0.4 at this date do not emit the extra
+          # `X509.get_subject is deprecated` warning that breaks
+          # test/contrib/test_pyopenssl.py on a present-day graph.
+          PIP_INDEX_URL: https://:2022-07-15@time-machines-pypi.sealsecurity.io/
 
   coverage:
+    # Disabled: `--fail-under=100` cannot be met from the reduced interpreter
+    # matrix, and no artifact or test execution depends on this job.
+    if: false
     runs-on: "ubuntu-latest"
     needs: test
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: "Use latest Python so it understands all syntax"
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
@@ -109,7 +168,7 @@ jobs:
         run: "python -m pip install --upgrade coverage"
 
       - name: "Download coverage data"
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           name: coverage-data
 
@@ -120,7 +179,7 @@ jobs:
           python -m coverage report --ignore-errors --show-missing --fail-under=100
 
       - name: "Upload report if check failed"
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: htmlcov

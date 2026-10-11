@@ -1,6 +1,8 @@
 name: lint
 
-on: [push, pull_request]
+# workflow_dispatch only: not part of the sealed build (lint gate); push would
+# fire it on every fork sync onto the retired ubuntu-20.04 label.
+on: workflow_dispatch
 
 jobs:
   lint:

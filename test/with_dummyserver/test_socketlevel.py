@@ -1879,6 +1879,12 @@ class TestRetryPoolSizeDrainFail(SocketDummyServerTestCase):
 
 class TestBrokenPipe(SocketDummyServerTestCase):
     @notWindows
+    @pytest.mark.skipif(
+        sys.platform == "darwin",
+        reason="darwin/BSD raises ECONNRESET(54) where Linux raises EPIPE, so the "
+        "broken-pipe path under test is never reached. Still exercised on the "
+        "Linux leg.",
+    )
     def test_ignore_broken_pipe_errors(self, monkeypatch):
         # On Windows an aborted connection raises an error on
         # attempts to read data out of a socket that's been closed.
